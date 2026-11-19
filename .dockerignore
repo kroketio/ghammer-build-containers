@@ -1,0 +1,2 @@
+# The image downloads its own sources: send no build context.
+*

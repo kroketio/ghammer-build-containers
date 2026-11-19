@@ -1,0 +1,108 @@
+# ghammer Windows (amd64) static build image
+
+FROM ubuntu:22.04@sha256:45e9ddc6895604674618a409ca9f73d301da8fdb75fe330e8e9a27b3b219e4ad
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+ARG JOBS=8
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils p7zip-full make perl python3 pkg-config ninja-build \
+      rapidjson-dev libglm-dev \
+      libegl1 libgl1 libfontconfig1 libfreetype6 libglib2.0-0 libx11-6 libxkbcommon0 zlib1g libzstd1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN printf '#!/bin/bash\nset -euo pipefail\ncurl -fsSL --retry 3 -o "$2" "$1"\necho "$3  $2" | sha256sum -c -\n' \
+      > /usr/local/bin/fetch && chmod +x /usr/local/bin/fetch
+
+ENV QT_TAR=/opt/qt-src/qt-everywhere-src-6.9.3.tar.xz
+RUN --mount=type=cache,id=qt-src,target=/opt/qt-src \
+    [ -f $QT_TAR ] || fetch https://download.qt.io/archive/qt/6.9/6.9.3/single/qt-everywhere-src-6.9.3.tar.xz $QT_TAR 59d4fbf50d2524a9082f85d565f0197316cde89c26e97cfc6c157cb255b7ea18
+
+RUN cd /tmp \
+    && fetch https://github.com/Kitware/CMake/releases/download/v3.31.9/cmake-3.31.9-linux-x86_64.tar.gz \
+         cmake.tar.gz 312d78e0b7c5c9b4a97a87a46c3e525aa84895fe8135c238c4616bba73dc9518 \
+    && mkdir /opt/cmake && tar xf cmake.tar.gz -C /opt/cmake --strip-components=1 && rm cmake.tar.gz \
+    && ln -s /opt/cmake/bin/cmake /usr/local/bin/cmake
+
+RUN cd /tmp \
+    && fetch https://github.com/mstorsjo/llvm-mingw/releases/download/20231128/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64.tar.xz \
+         llvm-mingw.tar.xz 0f21ff3be90311092fe32e0e30878ef3ae9d9437b8d9ac25ef279e0d84e9bb8e \
+    && mkdir /opt/llvm-mingw && tar xf llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1 && rm llvm-mingw.tar.xz
+ENV PATH=/opt/llvm-mingw/bin:$PATH
+
+ENV HOST_QT=/opt/ghammer/host-qt
+RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-3 libgssapi-krb5-2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p $HOST_QT/lib && cd /tmp \
+    && Q=https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_693/qt6_693 \
+    && P=6.9.3-0-202509261207 && R=Linux-RHEL_8_10-GCC-Linux-RHEL_8_10-X86_64 \
+    && fetch $Q/qt.qt6.693.linux_gcc_64/${P}qtbase-$R.7z base.7z \
+         2f02d19183df1b011fd7fe57aa2a1e9073b981f5bda7a8f9c96a6c64b8b7b06c \
+    && fetch $Q/qt.qt6.693.linux_gcc_64/${P}qtdeclarative-$R.7z decl.7z \
+         0542599fa56a548c98bde3d683ad83a3423266ce530e8b544a7eb0a96b63a4ea \
+    && fetch $Q/qt.qt6.693.addons.qtshadertools.linux_gcc_64/${P}qtshadertools-$R.7z st.7z \
+         ae278dbe132615ab2bd880f29249faafa9546f6a58617ffc8503c7765788c2d9 \
+    && fetch $Q/qt.qt6.693.linux_gcc_64/${P}icu-linux-Rhel8.6-x86_64.7z icu.7z \
+         419bf0ce8db44ce83b309564c1686bd897a8b36ae0c6a78498905ba4c30a0439 \
+    && for f in base decl st; do 7z x -y -bd -o$HOST_QT $f.7z > /dev/null; done \
+    && 7z x -y -bd -o$HOST_QT/lib icu.7z > /dev/null \
+    && rm /tmp/*.7z
+
+ENV WIN=/opt/ghammer/win
+ENV DEPS=$WIN/deps
+
+RUN mkdir -p $DEPS && printf '%s\n' \
+      'set(CMAKE_SYSTEM_NAME Windows)' \
+      'set(CMAKE_SYSTEM_PROCESSOR x86_64)' \
+      'set(CMAKE_C_COMPILER /opt/llvm-mingw/bin/x86_64-w64-mingw32-clang)' \
+      'set(CMAKE_CXX_COMPILER /opt/llvm-mingw/bin/x86_64-w64-mingw32-clang++)' \
+      'set(CMAKE_RC_COMPILER /opt/llvm-mingw/bin/x86_64-w64-mingw32-windres)' \
+      'set(CMAKE_FIND_ROOT_PATH /opt/llvm-mingw/x86_64-w64-mingw32 /opt/ghammer/win/deps /opt/ghammer/win/qt)' \
+      'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
+      'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)' \
+      'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)' \
+      'set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)' \
+      > $WIN/toolchain.cmake
+
+RUN cd /tmp \
+    && cm() { cmake -S "$1" -B "$1/b" -G Ninja -DCMAKE_TOOLCHAIN_FILE=$WIN/toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=$DEPS -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF "${@:2}" \
+              && cmake --build "$1/b" -j$JOBS && cmake --install "$1/b"; } \
+    \
+    && fetch https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.xz z.tar.xz \
+         38ef96b8dfe510d42707d9c781877914792541133e1870841463bfa73f883e32 \
+    && tar xf z.tar.xz && (cd zlib-1.3.1 && CC=x86_64-w64-mingw32-clang AR=x86_64-w64-mingw32-ar \
+         RANLIB=x86_64-w64-mingw32-ranlib ./configure --static --prefix=$DEPS && make -j$JOBS install) \
+    \
+    && fetch https://download.sourceforge.net/libpng/libpng-1.6.50.tar.xz png.tar.xz \
+         4df396518620a7aa3651443e87d1b2862e4e88cad135a8b93423e01706232307 \
+    && tar xf png.tar.xz && cm libpng-1.6.50 -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
+         -DPNG_EXECUTABLES=OFF -DZLIB_ROOT=$DEPS \
+    \
+    && fetch https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.296.tar.gz vk.tar.gz \
+         e204e0b3c19f622d197df945737f5db913d6621830999b8578d34e80a7c90585 \
+    && tar xf vk.tar.gz && cm Vulkan-Headers-1.3.296 -DVULKAN_HEADERS_ENABLE_MODULE=OFF -DVULKAN_HEADERS_ENABLE_TESTS=OFF \
+    \
+    && cp -r /usr/include/glm /usr/include/rapidjson $DEPS/include/ \
+    && mkdir -p $DEPS/lib/cmake/RapidJSON \
+    && printf 'set(RAPIDJSON_INCLUDE_DIRS "%s")\nset(RapidJSON_INCLUDE_DIRS "%s")\n' $DEPS/include $DEPS/include \
+         > $DEPS/lib/cmake/RapidJSON/RapidJSONConfig.cmake \
+    && rm -rf /tmp/*
+
+RUN --mount=type=cache,id=qt-src,target=/opt/qt-src cd /tmp \
+    && ([ -f $QT_TAR ] || fetch https://download.qt.io/archive/qt/6.9/6.9.3/single/qt-everywhere-src-6.9.3.tar.xz $QT_TAR 59d4fbf50d2524a9082f85d565f0197316cde89c26e97cfc6c157cb255b7ea18) \
+    && tar xf $QT_TAR -C /tmp \
+    && mkdir qt-build && cd qt-build \
+    && /tmp/qt-everywhere-src-6.9.3/configure -prefix $WIN/qt -static -static-runtime -release -opensource -confirm-license \
+         -xplatform win32-clang-g++ -qt-host-path $HOST_QT \
+         -submodules qtbase,qtdeclarative,qtshadertools,qtsvg,qtimageformats,qtwebsockets,qthttpserver \
+         -nomake examples -nomake tests \
+         -system-zlib -system-libpng -qt-libjpeg -qt-freetype -qt-harfbuzz -qt-pcre -sql-sqlite -qt-sqlite \
+         -no-opengl -feature-vulkan -schannel -no-openssl -no-icu -no-dbus \
+         -- -DCMAKE_TOOLCHAIN_FILE=$WIN/toolchain.cmake -DCMAKE_PREFIX_PATH=$DEPS \
+    && cmake --build . --parallel $JOBS && cmake --install . \
+    && cd / && rm -rf /tmp/* $QT_TAR
+
+WORKDIR /src
+CMD ["bash", "-c", "cmake -S /src -B /out/build-windows-amd64 -GNinja -C /src/cmake/windows-static.cmake && cmake --build /out/build-windows-amd64 -j8 --target client server"]
